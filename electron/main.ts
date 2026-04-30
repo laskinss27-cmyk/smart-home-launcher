@@ -29,11 +29,14 @@ function createWindow() {
   }
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   manager = new ModuleManager(() => win);
   createWindow();
+  // Подтягиваем актуальный список модулей с GitHub (без блокировки запуска).
+  manager.refreshRemoteModules();
 
   ipcMain.handle("modules:list",     () => manager.list());
+  ipcMain.handle("modules:refresh",  () => manager.refreshRemoteModules());
   ipcMain.handle("modules:check",    () => manager.checkUpdates());
   ipcMain.handle("modules:install",  (_e, id: string, force?: boolean) => manager.install(id, !!force));
   ipcMain.handle("modules:launch",   (_e, id: string) => manager.launch(id));

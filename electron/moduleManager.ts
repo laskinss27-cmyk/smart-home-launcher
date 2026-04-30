@@ -4,7 +4,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as https from "https";
 import { pipeline } from "stream/promises";
-import { ModuleDef, MODULES } from "./modules";
+import { ModuleDef, ModuleDefRaw, MODULES_FALLBACK, REMOTE_MODULES_URL, rawToDef } from "./modules";
 
 const MODULES_DIR = path.join(app.getPath("userData"), "modules");
 const STATE_FILE  = path.join(app.getPath("userData"), "state.json");
@@ -116,6 +116,8 @@ function findExe(dir: string, name: string): string | null {
 export class ModuleManager {
   private state: State = loadState();
   private running = new Map<string, ChildProcess>();
+  private modules: ModuleDef[] = MODULES_FALLBACK;
+  private modulesLoaded = false;
 
   constructor(private getWin: () => BrowserWindow | null) {
     fs.mkdirSync(MODULES_DIR, { recursive: true });
@@ -125,8 +127,23 @@ export class ModuleManager {
     this.getWin()?.webContents.send(channel, payload);
   }
 
+  /** Загружает свежий список модулей с GitHub. Молча падает на bundled fallback. */
+  async refreshRemoteModules() {
+    try {
+      const r = await httpRequest(REMOTE_MODULES_URL);
+      if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
+      const raw = JSON.parse(r.body.toString("utf8")) as ModuleDefRaw[];
+      if (!Array.isArray(raw) || raw.length === 0) throw new Error("empty list");
+      this.modules = raw.map(rawToDef);
+      this.modulesLoaded = true;
+      this.send("module-changed", this.list());
+    } catch (e: any) {
+      this.send("log", { id: "launcher", msg: `Список модулей: использую встроенный (${e.message})` });
+    }
+  }
+
   list() {
-    return MODULES.map((m) => ({
+    return this.modules.map((m) => ({
       id: m.id,
       name: m.name,
       description: m.description,
@@ -140,7 +157,7 @@ export class ModuleManager {
 
   async checkUpdates() {
     const out: Record<string, { current: string | null; latest: string; updateAvailable: boolean }> = {};
-    for (const m of MODULES) {
+    for (const m of this.modules) {
       try {
         const r = await getLatestRelease(m);
         const current = this.state.modules[m.id]?.tag ?? null;
@@ -153,7 +170,7 @@ export class ModuleManager {
   }
 
   async install(id: string, force = false) {
-    const m = MODULES.find((x) => x.id === id);
+    const m = this.modules.find((x) => x.id === id);
     if (!m) throw new Error("unknown module");
     const log = (msg: string) => this.send("log", { id, msg });
 
@@ -200,7 +217,7 @@ export class ModuleManager {
   }
 
   async launch(id: string) {
-    const m = MODULES.find((x) => x.id === id);
+    const m = this.modules.find((x) => x.id === id);
     if (!m) throw new Error("unknown module");
     if (this.running.has(id)) throw new Error("уже запущено");
     const st = this.state.modules[id];

@@ -11,7 +11,29 @@ export interface ModuleDef {
   gradient: [string, string];
 }
 
-export const MODULES: ModuleDef[] = [
+// Raw form parsed from remote modules.json (assetPattern stored as string)
+export interface ModuleDefRaw {
+  id: string;
+  name: string;
+  description: string;
+  repo: string;
+  assetPattern: string;
+  assetKind: AssetKind;
+  entryAfterExtract?: string;
+  gradient: [string, string];
+}
+
+export function rawToDef(r: ModuleDefRaw): ModuleDef {
+  return { ...r, assetPattern: new RegExp(r.assetPattern, "i") };
+}
+
+// URL списка модулей. Лаунчер тянет его при старте, чтобы добавление новых
+// модулей не требовало переустановки самого лаунчера.
+export const REMOTE_MODULES_URL =
+  "https://raw.githubusercontent.com/laskinss27-cmyk/smart-home-launcher/main/modules.json";
+
+// Bundled fallback — используется, если нет сети или удалённый JSON битый.
+export const MODULES_FALLBACK: ModuleDef[] = [
   {
     id: "ctv-document-suite",
     name: "КП и Каталоги",
