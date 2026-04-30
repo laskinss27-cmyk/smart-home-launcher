@@ -76,12 +76,62 @@ interface LatestRelease {
   asset: { name: string; url: string; size: number };
 }
 
-async function getLatestRelease(m: ModuleDef): Promise<LatestRelease> {
+/** HEAD-запрос с ручной обработкой редиректов (нужен Location, не сама страница). */
+function followRedirect(url: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const req = https.request(
+      { method: "HEAD", hostname: u.hostname, path: u.pathname + u.search,
+        headers: { "User-Agent": "smart-home-launcher" } },
+      (res) => {
+        if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          resolve(res.headers.location);
+        } else {
+          reject(new Error(`HTTP ${res.statusCode} (ожидался редирект)`));
+        }
+      }
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+/** Без GitHub API: github.com/owner/repo/releases/latest → Location: .../tag/<TAG>. */
+async function getLatestReleaseNoApi(m: ModuleDef): Promise<LatestRelease> {
+  if (!m.assetTemplate) throw new Error("assetTemplate не задан");
+  const loc = await followRedirect(`https://github.com/${m.repo}/releases/latest`);
+  const tagMatch = loc.match(/\/tag\/([^/?#]+)/);
+  if (!tagMatch) throw new Error(`Не удалось извлечь тег из ${loc}`);
+  const tag = decodeURIComponent(tagMatch[1]);
+  const version = tag.replace(/^v/, "");
+  const name = m.assetTemplate.replace(/\{tag\}/g, tag).replace(/\{version\}/g, version);
+  const url = `https://github.com/${m.repo}/releases/download/${encodeURIComponent(tag)}/${encodeURIComponent(name)}`;
+  return { tag, asset: { name, url, size: 0 } };
+}
+
+async function getLatestReleaseApi(m: ModuleDef): Promise<LatestRelease> {
   const data = await fetchJson(`https://api.github.com/repos/${m.repo}/releases/latest`);
   if (!data?.tag_name) throw new Error("Релиз не найден");
   const asset = (data.assets || []).find((a: any) => m.assetPattern.test(a.name));
   if (!asset) throw new Error(`В релизе ${data.tag_name} нет подходящего файла`);
-  return { tag: data.tag_name, asset: { name: asset.name, url: asset.url, size: asset.size } };
+  return { tag: data.tag_name, asset: { name: asset.name, url: asset.browser_download_url || asset.url, size: asset.size } };
+}
+
+const RELEASE_CACHE = new Map<string, { at: number; rel: LatestRelease }>();
+const RELEASE_TTL_MS = 30 * 60 * 1000;
+
+async function getLatestRelease(m: ModuleDef): Promise<LatestRelease> {
+  const cached = RELEASE_CACHE.get(m.id);
+  if (cached && Date.now() - cached.at < RELEASE_TTL_MS) return cached.rel;
+  // Сначала — без API (нет rate-limit), фолбэк — на API.
+  let rel: LatestRelease;
+  try {
+    rel = await getLatestReleaseNoApi(m);
+  } catch {
+    rel = await getLatestReleaseApi(m);
+  }
+  RELEASE_CACHE.set(m.id, { at: Date.now(), rel });
+  return rel;
 }
 
 async function extractZip(zipPath: string, outDir: string) {
