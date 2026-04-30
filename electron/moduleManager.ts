@@ -147,6 +147,33 @@ async function extractZip(zipPath: string, outDir: string) {
   });
 }
 
+async function rmDirWithRetry(dir: string, log: (m: string) => void): Promise<void> {
+  if (!fs.existsSync(dir)) return;
+  const delays = [0, 300, 800, 1500, 3000];
+  let lastErr: any;
+  for (const d of delays) {
+    if (d) await new Promise((r) => setTimeout(r, d));
+    try {
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+      if (!fs.existsSync(dir)) return;
+    } catch (e) {
+      lastErr = e;
+      log(`Не удалось удалить старую версию (попробую снова через ${d || 0}мс)...`);
+    }
+  }
+  // Последний шанс — переименовать "в сторону" и удалить асинхронно.
+  try {
+    const trash = dir + ".old-" + Date.now();
+    fs.renameSync(dir, trash);
+    fs.rm(trash, { recursive: true, force: true }, () => {});
+    return;
+  } catch (e) {
+    throw new Error(
+      `Не удалось очистить ${dir}. ${lastErr?.message ?? e}. Закройте модуль и/или удалите папку вручную.`
+    );
+  }
+}
+
 function findExe(dir: string, name: string): string | null {
   // Search up to 3 levels deep for the named exe.
   const stack: { dir: string; depth: number }[] = [{ dir, depth: 0 }];
@@ -222,6 +249,9 @@ export class ModuleManager {
   async install(id: string, force = false) {
     const m = this.modules.find((x) => x.id === id);
     if (!m) throw new Error("unknown module");
+    if (this.running.has(id)) {
+      throw new Error("Модуль сейчас запущен. Закройте его и повторите.");
+    }
     const log = (msg: string) => this.send("log", { id, msg });
 
     log(`Получаю информацию о последнем релизе ${m.name}...`);
@@ -233,7 +263,8 @@ export class ModuleManager {
     }
 
     const dir = moduleDir(m);
-    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+    // Windows иногда держит файлы (AV, отложенные хэндлы) — ретраим удаление.
+    await rmDirWithRetry(dir, log);
     fs.mkdirSync(dir, { recursive: true });
 
     log(`Скачиваю ${release.asset.name} (${(release.asset.size / 1024 / 1024).toFixed(1)} МБ)...`);
