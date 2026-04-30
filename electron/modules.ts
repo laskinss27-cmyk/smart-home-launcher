@@ -40,4 +40,14 @@ export const MODULES: ModuleDef[] = [
     assetKind: "exe",
     gradient: ["#f97316", "#ec4899"],
   },
+  {
+    id: "smart-home-calculator",
+    name: "Калькулятор УД",
+    description: "Подбор оборудования Shelly / HitePRO под сценарий объекта",
+    repo: "laskinss27-cmyk/smart-home-calculator",
+    assetPattern: /SmartHomeCalculator-.*-win\.zip$/i,
+    assetKind: "zip",
+    entryAfterExtract: "SmartHomeCalculator.exe",
+    gradient: ["#10b981", "#8b5cf6"],
+  },
 ];
