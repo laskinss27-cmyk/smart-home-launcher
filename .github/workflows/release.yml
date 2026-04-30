@@ -1,0 +1,47 @@
+name: Release Windows installer
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install deps
+        run: npm install
+
+      - name: Build (vite + electron-builder NSIS installer)
+        run: npm run dist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rename installer to ASCII name
+        shell: pwsh
+        run: |
+          $ver = (Get-Content package.json | ConvertFrom-Json).version
+          $src = Get-ChildItem release -Filter "*Setup*$ver.exe" | Select-Object -First 1
+          if ($src) {
+            $dst = "release/SmartHomeLauncher-Setup-$ver.exe"
+            Copy-Item $src.FullName $dst
+            Write-Host "Renamed to $dst"
+          } else {
+            throw "Installer for version $ver not found"
+          }
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/SmartHomeLauncher-Setup-*.exe
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
