@@ -192,25 +192,48 @@ export class ModuleManager {
     fs.mkdirSync(MODULES_DIR, { recursive: true });
     // На старте чистим осиротевшие папки старых версий — они уже точно никем не открыты.
     this.cleanupOldVersionsOnStartup();
+    this.reconcileState();
+  }
+
+  /** Сбрасываем записи state для модулей, у которых exe не существует —
+   *  иначе UI говорит "установлено", а запуск падает на "модуль не установлен". */
+  private reconcileState() {
+    let dirty = false;
+    for (const id of Object.keys(this.state.modules)) {
+      const st = this.state.modules[id];
+      if (!st?.exePath || !fs.existsSync(st.exePath)) {
+        delete this.state.modules[id];
+        dirty = true;
+      }
+    }
+    if (dirty) saveState(this.state);
   }
 
   private send(channel: string, payload: any) {
     this.getWin()?.webContents.send(channel, payload);
   }
 
-  /** Удаляем всё в <MODULES_DIR>/<id>/, кроме текущей версии из state. */
+  /** Удаляем всё в <MODULES_DIR>/<id>/, кроме текущей версии из state.
+   *  Если versionDir в state не задан — это legacy-установка от старого
+   *  лаунчера (плоская раскладка), её не трогаем: иначе снесём и сам exe.
+   *  Также игнорируем папку, если внутри неё лежит exePath из state — это
+   *  страхует от любых расхождений в имени тега/файловой системы. */
   private cleanupOldVersionsOnStartup() {
     for (const m of MODULES_FALLBACK) {
+      const st = this.state.modules[m.id];
+      if (!st?.versionDir) continue;       // legacy install — не трогаем
       const root = moduleRoot(m);
       if (!fs.existsSync(root)) continue;
-      const keep = this.state.modules[m.id]?.versionDir
-        ? path.basename(this.state.modules[m.id]!.versionDir!)
-        : null;
+      const keep = path.basename(st.versionDir);
+      const exeAbs = st.exePath ? path.resolve(st.exePath) : null;
       let entries: string[] = [];
       try { entries = fs.readdirSync(root); } catch { continue; }
       for (const name of entries) {
-        if (keep && name === keep) continue;
-        rmDirSafe(path.join(root, name));
+        if (name === keep) continue;
+        const full = path.join(root, name);
+        // Если exe из state лежит внутри этой папки — оставляем (legacy в подпапке).
+        if (exeAbs && exeAbs.startsWith(path.resolve(full) + path.sep)) continue;
+        rmDirSafe(full);
       }
     }
   }
