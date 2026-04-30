@@ -1,5 +1,5 @@
 import { app, BrowserWindow } from "electron";
-import { spawn, ChildProcess } from "child_process";
+import { spawn, ChildProcess, execFile } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import * as https from "https";
@@ -10,9 +10,10 @@ const MODULES_DIR = path.join(app.getPath("userData"), "modules");
 const STATE_FILE  = path.join(app.getPath("userData"), "state.json");
 
 interface ModuleState {
-  tag?: string;        // installed release tag, e.g. "v1.0.0"
-  asset?: string;      // installed asset filename
-  exePath?: string;    // absolute path to launchable .exe
+  tag?: string;            // installed release tag, e.g. "v1.0.0"
+  asset?: string;          // installed asset filename
+  exePath?: string;        // absolute path to launchable .exe
+  versionDir?: string;     // абсолютный путь к папке этой версии (<MODULES_DIR>/<id>/<safeTag>/)
   installedAt?: string;
 }
 interface State { modules: Record<string, ModuleState>; }
@@ -26,7 +27,12 @@ function saveState(s: State) {
   fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
 }
 
-function moduleDir(m: ModuleDef) { return path.join(MODULES_DIR, m.id); }
+function moduleRoot(m: ModuleDef) { return path.join(MODULES_DIR, m.id); }
+/** "v1.2.0" → "v1.2.0", любой не-ASCII заменяем на _ для безопасности файловой системы. */
+function safeTag(tag: string) { return tag.replace(/[^A-Za-z0-9._-]/g, "_"); }
+function versionDirFor(m: ModuleDef, tag: string) {
+  return path.join(moduleRoot(m), safeTag(tag));
+}
 
 function httpRequest(url: string, opts: https.RequestOptions = {}): Promise<{ status: number; headers: any; body: Buffer }> {
   return new Promise((resolve, reject) => {
@@ -123,20 +129,15 @@ const RELEASE_TTL_MS = 30 * 60 * 1000;
 async function getLatestRelease(m: ModuleDef): Promise<LatestRelease> {
   const cached = RELEASE_CACHE.get(m.id);
   if (cached && Date.now() - cached.at < RELEASE_TTL_MS) return cached.rel;
-  // Сначала — без API (нет rate-limit), фолбэк — на API.
   let rel: LatestRelease;
-  try {
-    rel = await getLatestReleaseNoApi(m);
-  } catch {
-    rel = await getLatestReleaseApi(m);
-  }
+  try { rel = await getLatestReleaseNoApi(m); }
+  catch { rel = await getLatestReleaseApi(m); }
   RELEASE_CACHE.set(m.id, { at: Date.now(), rel });
   return rel;
 }
 
 async function extractZip(zipPath: string, outDir: string) {
   fs.mkdirSync(outDir, { recursive: true });
-  // PowerShell Expand-Archive is built into Windows.
   await new Promise<void>((resolve, reject) => {
     const p = spawn("powershell.exe", [
       "-NoProfile", "-NonInteractive", "-Command",
@@ -147,35 +148,27 @@ async function extractZip(zipPath: string, outDir: string) {
   });
 }
 
-async function rmDirWithRetry(dir: string, log: (m: string) => void): Promise<void> {
-  if (!fs.existsSync(dir)) return;
-  const delays = [0, 300, 800, 1500, 3000];
-  let lastErr: any;
-  for (const d of delays) {
-    if (d) await new Promise((r) => setTimeout(r, d));
-    try {
-      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
-      if (!fs.existsSync(dir)) return;
-    } catch (e) {
-      lastErr = e;
-      log(`Не удалось удалить старую версию (попробую снова через ${d || 0}мс)...`);
+/** Жёстко гасим всё дерево процессов по PID (Windows). Не падаем, если уже мёртв. */
+function killTree(pid: number): Promise<void> {
+  return new Promise((resolve) => {
+    if (process.platform !== "win32") {
+      try { process.kill(pid, "SIGKILL"); } catch {}
+      return resolve();
     }
-  }
-  // Последний шанс — переименовать "в сторону" и удалить асинхронно.
-  try {
-    const trash = dir + ".old-" + Date.now();
-    fs.renameSync(dir, trash);
-    fs.rm(trash, { recursive: true, force: true }, () => {});
-    return;
-  } catch (e) {
-    throw new Error(
-      `Не удалось очистить ${dir}. ${lastErr?.message ?? e}. Закройте модуль и/или удалите папку вручную.`
-    );
+    execFile("taskkill.exe", ["/PID", String(pid), "/T", "/F"], () => resolve());
+  });
+}
+
+function rmDirSafe(dir: string) {
+  if (!fs.existsSync(dir)) return;
+  try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }); }
+  catch {
+    // если не удалось — переименуем, чтобы не мешалось; почистится при следующем старте
+    try { fs.renameSync(dir, dir + ".old-" + Date.now()); } catch {}
   }
 }
 
 function findExe(dir: string, name: string): string | null {
-  // Search up to 3 levels deep for the named exe.
   const stack: { dir: string; depth: number }[] = [{ dir, depth: 0 }];
   while (stack.length) {
     const { dir: d, depth } = stack.pop()!;
@@ -192,16 +185,34 @@ function findExe(dir: string, name: string): string | null {
 
 export class ModuleManager {
   private state: State = loadState();
-  private running = new Map<string, ChildProcess>();
+  private running = new Map<string, { proc: ChildProcess; pid: number }>();
   private modules: ModuleDef[] = MODULES_FALLBACK;
-  private modulesLoaded = false;
 
   constructor(private getWin: () => BrowserWindow | null) {
     fs.mkdirSync(MODULES_DIR, { recursive: true });
+    // На старте чистим осиротевшие папки старых версий — они уже точно никем не открыты.
+    this.cleanupOldVersionsOnStartup();
   }
 
   private send(channel: string, payload: any) {
     this.getWin()?.webContents.send(channel, payload);
+  }
+
+  /** Удаляем всё в <MODULES_DIR>/<id>/, кроме текущей версии из state. */
+  private cleanupOldVersionsOnStartup() {
+    for (const m of MODULES_FALLBACK) {
+      const root = moduleRoot(m);
+      if (!fs.existsSync(root)) continue;
+      const keep = this.state.modules[m.id]?.versionDir
+        ? path.basename(this.state.modules[m.id]!.versionDir!)
+        : null;
+      let entries: string[] = [];
+      try { entries = fs.readdirSync(root); } catch { continue; }
+      for (const name of entries) {
+        if (keep && name === keep) continue;
+        rmDirSafe(path.join(root, name));
+      }
+    }
   }
 
   /** Загружает свежий список модулей с GitHub. Молча падает на bundled fallback. */
@@ -212,7 +223,6 @@ export class ModuleManager {
       const raw = JSON.parse(r.body.toString("utf8")) as ModuleDefRaw[];
       if (!Array.isArray(raw) || raw.length === 0) throw new Error("empty list");
       this.modules = raw.map(rawToDef);
-      this.modulesLoaded = true;
       this.send("module-changed", this.list());
     } catch (e: any) {
       this.send("log", { id: "launcher", msg: `Список модулей: использую встроенный (${e.message})` });
@@ -246,12 +256,22 @@ export class ModuleManager {
     return out;
   }
 
+  /** Если модуль ещё запущен — гасим его дерево процессов и ждём, пока state очистится. */
+  private async ensureStopped(id: string, log: (m: string) => void) {
+    const r = this.running.get(id);
+    if (!r) return;
+    log("Закрываю запущенный модуль...");
+    await killTree(r.pid);
+    // ждём, пока 'exit' хэндлер уберёт запись (taskkill /F работает почти моментально)
+    for (let i = 0; i < 50 && this.running.has(id); i++) {
+      await new Promise((res) => setTimeout(res, 100));
+    }
+    this.running.delete(id);
+  }
+
   async install(id: string, force = false) {
     const m = this.modules.find((x) => x.id === id);
     if (!m) throw new Error("unknown module");
-    if (this.running.has(id)) {
-      throw new Error("Модуль сейчас запущен. Закройте его и повторите.");
-    }
     const log = (msg: string) => this.send("log", { id, msg });
 
     log(`Получаю информацию о последнем релизе ${m.name}...`);
@@ -262,13 +282,17 @@ export class ModuleManager {
       return;
     }
 
-    const dir = moduleDir(m);
-    // Windows иногда держит файлы (AV, отложенные хэндлы) — ретраим удаление.
-    await rmDirWithRetry(dir, log);
-    fs.mkdirSync(dir, { recursive: true });
+    // Если модуль запущен — гасим (даже если "тот же" процесс уже не наш ребёнок,
+    // мы хотя бы остановим всё, что мы сами запустили).
+    await this.ensureStopped(id, log);
 
-    log(`Скачиваю ${release.asset.name} (${(release.asset.size / 1024 / 1024).toFixed(1)} МБ)...`);
-    const downloadPath = path.join(dir, release.asset.name);
+    // Папка новой версии — отдельная. Старая остаётся нетронутой.
+    const vdir = versionDirFor(m, release.tag);
+    rmDirSafe(vdir);          // на случай битой предыдущей попытки в ту же версию
+    fs.mkdirSync(vdir, { recursive: true });
+
+    log(`Скачиваю ${release.asset.name}${release.asset.size ? ` (${(release.asset.size / 1024 / 1024).toFixed(1)} МБ)` : ""}...`);
+    const downloadPath = path.join(vdir, release.asset.name);
     await downloadToFile(release.asset.url, downloadPath, (pct) => {
       if (pct % 10 === 0) log(`  ${pct}%`);
     });
@@ -278,21 +302,33 @@ export class ModuleManager {
       exePath = downloadPath;
     } else {
       log("Распаковываю...");
-      const extractDir = path.join(dir, "app");
+      const extractDir = path.join(vdir, "app");
       await extractZip(downloadPath, extractDir);
-      fs.unlinkSync(downloadPath);
+      try { fs.unlinkSync(downloadPath); } catch {}
       const found = findExe(extractDir, m.entryAfterExtract!);
       if (!found) throw new Error(`Не найден ${m.entryAfterExtract} в архиве`);
       exePath = found;
     }
 
+    // Запоминаем старую версию, чтобы удалить её после атомарного переключения.
+    const prevVersionDir = this.state.modules[m.id]?.versionDir;
+
     this.state.modules[m.id] = {
       tag: release.tag,
       asset: release.asset.name,
       exePath,
+      versionDir: vdir,
       installedAt: new Date().toISOString(),
     };
     saveState(this.state);
+
+    // Старую папку чистим best-effort — не падаем, если занята:
+    // на следующем старте лаунчера cleanupOldVersionsOnStartup её добьёт.
+    if (prevVersionDir && prevVersionDir !== vdir && fs.existsSync(prevVersionDir)) {
+      log("Удаляю старую версию...");
+      rmDirSafe(prevVersionDir);
+    }
+
     log(`Готово: ${m.name} ${release.tag} установлен.`);
     this.send("module-changed", this.list());
   }
@@ -304,19 +340,83 @@ export class ModuleManager {
     const st = this.state.modules[id];
     if (!st?.exePath || !fs.existsSync(st.exePath)) throw new Error("модуль не установлен");
 
+    // detached + ignore stdio: лаунчер не держит pipes на дочерний процесс,
+    // ОС не считает его виновником при попытке удалить файлы модуля.
     const proc = spawn(st.exePath, [], {
       cwd: path.dirname(st.exePath),
-      detached: false,
+      detached: true,
+      stdio: "ignore",
       windowsHide: false,
     });
+    proc.unref();
 
     proc.on("exit", () => {
       this.running.delete(id);
       this.send("module-changed", this.list());
     });
-    proc.on("error", (e) => this.send("log", { id, msg: `Ошибка запуска: ${e.message}` }));
+    proc.on("error", (e) => {
+      this.running.delete(id);
+      this.send("log", { id, msg: `Ошибка запуска: ${e.message}` });
+      this.send("module-changed", this.list());
+    });
 
-    this.running.set(id, proc);
+    if (proc.pid) this.running.set(id, { proc, pid: proc.pid });
     this.send("module-changed", this.list());
   }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Self-update лаунчера: тянем NSIS .exe c релиза и запускаем его, лаунчер
+// при этом завершается. NSIS установит поверх и перезапустит.
+// ───────────────────────────────────────────────────────────────────────────
+
+const LAUNCHER_REPO = "laskinss27-cmyk/smart-home-launcher";
+const LAUNCHER_ASSET_TEMPLATE = "SmartHomeLauncher-Setup-{version}.exe";
+
+export async function checkLauncherUpdate(): Promise<{ current: string; latest: string; updateAvailable: boolean }> {
+  const fakeMod: ModuleDef = {
+    id: "__launcher__",
+    name: "Smart Home Launcher",
+    description: "",
+    repo: LAUNCHER_REPO,
+    assetPattern: /SmartHomeLauncher-Setup-.*\.exe$/i,
+    assetTemplate: LAUNCHER_ASSET_TEMPLATE,
+    assetKind: "exe",
+    gradient: ["#000", "#000"],
+  };
+  const r = await getLatestRelease(fakeMod);
+  const current = "v" + app.getVersion();
+  return { current, latest: r.tag, updateAvailable: current !== r.tag };
+}
+
+export async function installLauncherUpdate(onLog: (msg: string) => void): Promise<void> {
+  const fakeMod: ModuleDef = {
+    id: "__launcher__",
+    name: "Smart Home Launcher",
+    description: "",
+    repo: LAUNCHER_REPO,
+    assetPattern: /SmartHomeLauncher-Setup-.*\.exe$/i,
+    assetTemplate: LAUNCHER_ASSET_TEMPLATE,
+    assetKind: "exe",
+    gradient: ["#000", "#000"],
+  };
+  onLog("Получаю информацию о последнем релизе лаунчера...");
+  const r = await getLatestRelease(fakeMod);
+  const current = "v" + app.getVersion();
+  if (current === r.tag) {
+    onLog("Уже последняя версия.");
+    return;
+  }
+  const tmpDir = app.getPath("temp");
+  const dest = path.join(tmpDir, r.asset.name);
+  onLog(`Скачиваю ${r.asset.name}...`);
+  await downloadToFile(r.asset.url, dest, (pct) => {
+    if (pct % 10 === 0) onLog(`  ${pct}%`);
+  });
+  onLog("Запускаю установщик. Лаунчер сейчас закроется.");
+  // Запускаем установщик отвязанно — он переживёт нас.
+  const child = spawn(dest, [], { detached: true, stdio: "ignore" });
+  child.unref();
+  // Даём установщику стартануть и закрываемся.
+  setTimeout(() => app.quit(), 500);
 }

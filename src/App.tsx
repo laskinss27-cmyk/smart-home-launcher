@@ -9,20 +9,35 @@ export function App() {
   const [updates, setUpdates] = useState<Record<string, UpdateInfo>>({});
   const [busy, setBusy] = useState<Record<string, boolean>>({});
   const [logs, setLogs] = useState<LogLine[]>([]);
+  const [appVersion, setAppVersion] = useState<string>("");
+  const [selfUpdate, setSelfUpdate] = useState<{ current: string; latest: string; updateAvailable: boolean } | null>(null);
+  const [selfBusy, setSelfBusy] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
 
   const refresh = async () => setModules(await window.api.list());
 
   useEffect(() => {
     refresh();
+    window.api.appVersion().then(setAppVersion).catch(() => {});
     const offLog = window.api.onLog(({ id, msg }) =>
       setLogs((prev) => [...prev.slice(-400), { id, msg, t: Date.now() }])
     );
     const offChange = window.api.onChange(setModules);
     checkUpdates();
-    const interval = setInterval(checkUpdates, 5 * 60 * 1000);
+    checkSelf();
+    const interval = setInterval(() => { checkUpdates(); checkSelf(); }, 5 * 60 * 1000);
     return () => { offLog(); offChange(); clearInterval(interval); };
   }, []);
+
+  const checkSelf = async () => {
+    try { setSelfUpdate(await window.api.checkSelfUpdate()); } catch {}
+  };
+
+  const handleSelfUpdate = async () => {
+    setSelfBusy(true);
+    try { await window.api.installSelfUpdate(); }
+    catch (e: any) { setLogs((p) => [...p, { id: "launcher", msg: `Ошибка: ${e.message}`, t: Date.now() }]); setSelfBusy(false); }
+  };
 
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
@@ -56,11 +71,21 @@ export function App() {
           <img src={logo} alt="logo" />
           <div>
             <div className="title">УМНЫЙ ДОМ</div>
-            <div className="sub">Launcher v1.0</div>
+            <div className="sub">Launcher{appVersion ? ` v${appVersion}` : ""}</div>
           </div>
         </div>
         <div className="spacer" />
-        <button className="btn" onClick={checkUpdates}>Проверить обновления</button>
+        {selfUpdate?.updateAvailable && (
+          <button
+            className="btn primary"
+            disabled={selfBusy}
+            onClick={handleSelfUpdate}
+            title={`Текущая ${selfUpdate.current} → новая ${selfUpdate.latest}`}
+          >
+            {selfBusy ? "Обновление лаунчера…" : `Обновить лаунчер ${selfUpdate.latest}`}
+          </button>
+        )}
+        <button className="btn" onClick={() => { checkUpdates(); checkSelf(); }}>Проверить обновления</button>
       </div>
 
       <div className="main">

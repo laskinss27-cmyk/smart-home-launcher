@@ -1,6 +1,6 @@
 import { app, BrowserWindow, ipcMain, shell } from "electron";
 import * as path from "path";
-import { ModuleManager } from "./moduleManager";
+import { ModuleManager, checkLauncherUpdate, installLauncherUpdate } from "./moduleManager";
 
 let win: BrowserWindow | null = null;
 let manager: ModuleManager;
@@ -41,6 +41,11 @@ app.whenReady().then(async () => {
   ipcMain.handle("modules:install",  (_e, id: string, force?: boolean) => manager.install(id, !!force));
   ipcMain.handle("modules:launch",   (_e, id: string) => manager.launch(id));
   ipcMain.handle("app:openExternal", (_e, url: string) => shell.openExternal(url));
+  ipcMain.handle("app:version",      () => app.getVersion());
+  ipcMain.handle("app:checkSelfUpdate",   () => checkLauncherUpdate());
+  ipcMain.handle("app:installSelfUpdate", () =>
+    installLauncherUpdate((msg) => win?.webContents.send("log", { id: "launcher", msg }))
+  );
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

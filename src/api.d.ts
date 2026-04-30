@@ -25,6 +25,9 @@ declare global {
       install: (id: string, force?: boolean) => Promise<void>;
       launch: (id: string) => Promise<void>;
       openExternal: (url: string) => Promise<void>;
+      appVersion: () => Promise<string>;
+      checkSelfUpdate: () => Promise<{ current: string; latest: string; updateAvailable: boolean }>;
+      installSelfUpdate: () => Promise<void>;
       onLog: (cb: (e: { id: string; msg: string }) => void) => () => void;
       onChange: (cb: (modules: ModuleInfo[]) => void) => () => void;
     };
