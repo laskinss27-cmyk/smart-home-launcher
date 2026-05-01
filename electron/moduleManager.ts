@@ -102,7 +102,31 @@ function followRedirect(url: string): Promise<string> {
   });
 }
 
-/** Без GitHub API: github.com/owner/repo/releases/latest → Location: .../tag/<TAG>. */
+/** HEAD по download-URL: 200/302 → existsует, 404 → нет. Без скачивания. */
+function headExists(url: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const u = new URL(url);
+    const req = https.request(
+      { method: "HEAD", hostname: u.hostname, path: u.pathname + u.search,
+        headers: { "User-Agent": "smart-home-launcher" } },
+      (res) => {
+        const code = res.statusCode || 0;
+        if (code >= 300 && code < 400 && res.headers.location) {
+          headExists(res.headers.location).then(resolve);
+        } else {
+          resolve(code === 200);
+        }
+      }
+    );
+    req.on("error", () => resolve(false));
+    req.end();
+  });
+}
+
+/** Без GitHub API: github.com/owner/repo/releases/latest → Location: .../tag/<TAG>.
+ *  Дополнительно HEAD-проверяем готовый URL — если репозиторий релизит ассет с
+ *  именем, не совпадающим с {version} (бывает при ручных загрузках), сообщаем
+ *  об отсутствии, чтобы вызывающий код перешёл на API-поиск по regex. */
 async function getLatestReleaseNoApi(m: ModuleDef): Promise<LatestRelease> {
   if (!m.assetTemplate) throw new Error("assetTemplate не задан");
   const loc = await followRedirect(`https://github.com/${m.repo}/releases/latest`);
@@ -112,6 +136,9 @@ async function getLatestReleaseNoApi(m: ModuleDef): Promise<LatestRelease> {
   const version = tag.replace(/^v/, "");
   const name = m.assetTemplate.replace(/\{tag\}/g, tag).replace(/\{version\}/g, version);
   const url = `https://github.com/${m.repo}/releases/download/${encodeURIComponent(tag)}/${encodeURIComponent(name)}`;
+  if (!(await headExists(url))) {
+    throw new Error(`Файл по шаблону не найден: ${name}`);
+  }
   return { tag, asset: { name, url, size: 0 } };
 }
 
