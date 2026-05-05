@@ -64,9 +64,10 @@ export const MODULES_FALLBACK: ModuleDef[] = [
     name: "Ценники",
     description: "Печать ценников из базы товаров",
     repo: "laskinss27-cmyk/price_tags",
-    assetPattern: /price_tags\.exe$/i,
-    assetTemplate: "price_tags.exe",
-    assetKind: "exe",
+    assetPattern: /price_tags-.*-win\.zip$/i,
+    assetTemplate: "price_tags-{version}-win.zip",
+    assetKind: "zip",
+    entryAfterExtract: "price_tags.exe",
     gradient: ["#f97316", "#ec4899"],
   },
   {
